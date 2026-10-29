@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "market-gig (Firebase)",
+      "type": "dart",
+      "request": "launch",
+      "program": "lib/main.dart",
+      "args": [
+        "--dart-define=CLOUDINARY_CLOUD_NAME=jumpkr6r",
+        "--dart-define=CLOUDINARY_UPLOAD_PRESET=marketgig"
+      ]
+    },
+    {
+      "name": "market-gig (Firebase) - Preview",
+      "type": "dart",
+      "request": "launch",
+      "program": "lib/previews/preview_main.dart"
+    }
+  ]
+}

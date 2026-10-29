@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Branded splash: deepTeal background, shown while Flutter engine initializes -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/splash_background" />
+    <!-- Centered branding icon/text is drawn by Flutter BrandedSplash after first frame;
+         keep native layer minimal to avoid ANR from heavy drawable decode -->
+</layer-list>

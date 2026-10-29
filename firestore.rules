@@ -1,0 +1,382 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isOwner(ownerId) {
+      return signedIn() && request.auth.uid == ownerId;
+    }
+    function docPath(collection, id) {
+      return /databases/$(database)/documents/$(collection)/$(id);
+    }
+
+    // Rating aggregates (rating_sum / rating_count on a profile or listing)
+    // must move exactly as the caller's review moved in this same write:
+    // count +1 on create, 0 on edit, -1 on delete; sum by new minus old
+    // rating. Profiles from before rating_sum existed fall back to
+    // round(rating_avg * rating_count), as the client does.
+    function aggregateFollowsReview(target, review) {
+      let before = get(target).data;
+      let after = getAfter(target).data;
+      let oldCount = before.get('rating_count', 0);
+      let oldSum = before.get('rating_sum',
+        math.round(before.get('rating_avg', 0) * oldCount));
+      let had = exists(review);
+      let has = existsAfter(review);
+      return after.get('rating_count', 0)
+          == oldCount + (has ? 1 : 0) - (had ? 1 : 0)
+        && after.get('rating_sum', 0)
+          == oldSum + (has ? getAfter(review).data.rating : 0)
+            - (had ? get(review).data.rating : 0);
+    }
+    // A review write must carry its aggregate update — unless the profile or
+    // listing is gone, leaving nothing to keep in step.
+    function aggregateOk(target, review) {
+      return !exists(target) || aggregateFollowsReview(target, review);
+    }
+    function noRatingKeys() {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+        .hasAny(['rating_avg', 'rating_sum', 'rating_count']);
+    }
+    function onlyRatingKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly(['rating_sum', 'rating_count']);
+    }
+    // Verified reviews: the review must cite a thread (listing chat or DM)
+    // between the caller and [other] in which a message was sent, and
+    // neither side may have blocked the other.
+    function chattedWith(conversationId, other) {
+      let thread = get(docPath('conversations', conversationId)).data;
+      return request.auth.uid in thread.participant_ids
+        && other in thread.participant_ids
+        && thread.get('last_message', '') != ''
+        && !blockedBetween(request.auth.uid, other);
+    }
+    // Comment / owner reply length cap (matches reviewTextMaxLength).
+    function shortText(data, field) {
+      return data.get(field, '') is string
+        && data.get(field, '').size() <= 500;
+    }
+    function replyKeys() {
+      return ['reply', 'reply_at'];
+    }
+    // The reviewed user / listing owner answering a review: only the reply
+    // fields may change.
+    function validReply(ownerId) {
+      return isOwner(ownerId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(replyKeys())
+        && shortText(request.resource.data, 'reply');
+    }
+    function noReplyKeys() {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+        .hasAny(replyKeys());
+    }
+    function zeroRating(data) {
+      return data.get('rating_avg', 0) == 0
+        && data.get('rating_sum', 0) == 0
+        && data.get('rating_count', 0) == 0;
+    }
+
+    // Active listings are public (feed discovery); other statuses are
+    // visible to the owner and to anyone who chatted about the listing (so
+    // review aggregates stay maintainable after it's paused/completed).
+    // Missing docs are readable so clients can tell "deleted" apart.
+    // Creates/updates must carry the caller's uid; the product-review
+    // aggregate (rating_sum / rating_count) starts at 0 and only moves with
+    // a review written in the same request.
+    match /listings/{listingId} {
+      allow read: if resource == null
+        || ('status' in resource.data && resource.data.status == 0)
+        || (signedIn() && 'owner_id' in resource.data
+          && resource.data.owner_id == request.auth.uid)
+        || (signedIn() && exists(docPath('conversations',
+          listingId + '_' + request.auth.uid)));
+      allow create: if signedIn()
+        && request.resource.data.owner_id == request.auth.uid
+        && zeroRating(request.resource.data);
+      allow update: if (isOwner(resource.data.owner_id)
+          && request.resource.data.owner_id == resource.data.owner_id
+          && noRatingKeys())
+        || (signedIn() && !isOwner(resource.data.owner_id)
+          && onlyRatingKeys()
+          && aggregateFollowsReview(docPath('listings', listingId),
+            docPath('listing_reviews', request.auth.uid + '_' + listingId)));
+      // Deletes carry no request.resource, so only the stored owner counts.
+      allow delete: if isOwner(resource.data.owner_id);
+    }
+
+    // Listing reports: doc id is "{reporterUid}_{listingId}", so each user can
+    // report a listing once. Create-only; reviewed in the Firebase console.
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.reporter_id == request.auth.uid
+        && request.resource.data.listing_owner_id != request.auth.uid;
+      allow read: if signedIn()
+        && resource.data.reporter_id == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Per-user swipe state: doc id is "{uid}_{listingId}".
+    match /swipes/{swipeId} {
+      allow read: if signedIn()
+        && resource.data.user_id == request.auth.uid;
+      allow create, update: if signedIn()
+        && request.resource.data.user_id == request.auth.uid;
+      allow delete: if signedIn()
+        && resource.data.user_id == request.auth.uid;
+    }
+
+    // Profiles are publicly readable (discovery + reviews); each user owns
+    // their own doc for profile fields. The rating aggregate is moved by the
+    // reviewer's transaction: another signed-in user may change ONLY
+    // rating_sum/rating_count, and only by exactly what their own review
+    // changed in the same write. The owner may never touch them.
+    match /profiles/{userId} {
+      allow read: if true;
+      allow create: if isOwner(userId) && zeroRating(request.resource.data);
+      allow update: if (isOwner(userId) && noRatingKeys())
+        || (signedIn() && !isOwner(userId)
+          && onlyRatingKeys()
+          && aggregateFollowsReview(docPath('profiles', userId),
+            docPath('reviews', request.auth.uid + '_' + userId)));
+
+      // FCM registration tokens written by `initPushNotifications` after
+      // sign-in; owner-only (tokens are per-device credentials).
+      match /fcm_tokens/{tokenId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // Reviews: any signed-in user may write one review per reviewer/reviewee
+    // pair (doc id "{reviewerUid}_{revieweeUid}") about someone else — never
+    // themselves — citing a chat they had (verified). The fixed id means
+    // create happens once; after that only the author may edit it, without
+    // changing its target, original date, or the reviewee's reply. The
+    // reviewee may only set/remove their reply.
+    match /reviews/{reviewId} {
+      function validReview() {
+        let data = request.resource.data;
+        return data.reviewer_id == request.auth.uid
+          && data.reviewee_id is string
+          && data.reviewee_id != request.auth.uid
+          && reviewId == request.auth.uid + '_' + data.reviewee_id
+          && data.rating is int
+          && data.rating >= 1 && data.rating <= 5
+          && shortText(data, 'comment')
+          && data.get('verified', false) == true
+          && data.conversation_id is string
+          && chattedWith(data.conversation_id, data.reviewee_id);
+      }
+      function aggregateMoved(revieweeId) {
+        return aggregateOk(docPath('profiles', revieweeId),
+          docPath('reviews', reviewId));
+      }
+      allow read: if true;
+      allow create: if signedIn() && validReview()
+        && aggregateMoved(request.resource.data.reviewee_id);
+      allow update: if signedIn()
+        && resource.data.reviewer_id == request.auth.uid
+        && request.resource.data.reviewee_id == resource.data.reviewee_id
+        && request.resource.data.created_at == resource.data.created_at
+        && noReplyKeys()
+        && validReview()
+        && aggregateMoved(resource.data.reviewee_id);
+      allow update: if validReply(resource.data.reviewee_id);
+      allow delete: if signedIn()
+        && resource.data.reviewer_id == request.auth.uid
+        && aggregateMoved(resource.data.reviewee_id);
+    }
+
+    // Product reviews: one per user per listing (doc id
+    // "{reviewerUid}_{listingId}"), only after messaging the owner about it
+    // (thread "{listingId}_{reviewerUid}"); editable only by its author
+    // without changing the listing, original date, or the owner's reply.
+    // The listing's owner can't review it but may reply. The owner is read
+    // from the listing itself so it can't be spoofed.
+    match /listing_reviews/{reviewId} {
+      function validListingReview() {
+        let data = request.resource.data;
+        let ownerId = get(/databases/$(database)/documents/listings/$(data.listing_id))
+          .data.owner_id;
+        return data.reviewer_id == request.auth.uid
+          && data.listing_id is string
+          && reviewId == request.auth.uid + '_' + data.listing_id
+          && data.listing_owner_id == ownerId
+          && ownerId != request.auth.uid
+          && data.rating is int
+          && data.rating >= 1 && data.rating <= 5
+          && shortText(data, 'comment')
+          && data.get('verified', false) == true
+          && data.conversation_id == data.listing_id + '_' + request.auth.uid
+          && chattedWith(data.conversation_id, ownerId);
+      }
+      function aggregateMoved(listingId) {
+        return aggregateOk(docPath('listings', listingId),
+          docPath('listing_reviews', reviewId));
+      }
+      allow read: if true;
+      allow create: if signedIn() && validListingReview()
+        && aggregateMoved(request.resource.data.listing_id);
+      allow update: if signedIn()
+        && resource.data.reviewer_id == request.auth.uid
+        && request.resource.data.listing_id == resource.data.listing_id
+        && request.resource.data.created_at == resource.data.created_at
+        && noReplyKeys()
+        && validListingReview()
+        && aggregateMoved(resource.data.listing_id);
+      allow update: if validReply(resource.data.listing_owner_id);
+      allow delete: if signedIn()
+        && resource.data.reviewer_id == request.auth.uid
+        && aggregateMoved(resource.data.listing_id);
+    }
+
+    // Review reports: doc id "{reporterUid}_{kind}_{reviewId}", once per
+    // review per user, never about your own review. Create-only; reviewed
+    // in the Firebase console.
+    match /review_reports/{reportId} {
+      function reportedReview(data) {
+        return get(docPath(
+          data.review_kind == 'listing' ? 'listing_reviews' : 'reviews',
+          data.review_id)).data;
+      }
+      allow create: if signedIn()
+        && request.resource.data.reporter_id == request.auth.uid
+        && request.resource.data.review_kind in ['user', 'listing']
+        && request.resource.data.review_id is string
+        && reportId == request.auth.uid + '_'
+          + request.resource.data.review_kind + '_'
+          + request.resource.data.review_id
+        && reportedReview(request.resource.data).reviewer_id
+          != request.auth.uid;
+      allow read: if signedIn()
+        && resource.data.reporter_id == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // True when either user blocked the other (blocks/{blocker}_{blocked}).
+    function blockedBetween(a, b) {
+      return exists(/databases/$(database)/documents/blocks/$(a + '_' + b))
+        || exists(/databases/$(database)/documents/blocks/$(b + '_' + a));
+    }
+
+    // Blocks: doc id "{blockerUid}_{blockedUid}"; only the blocker sees or
+    // removes it. The chat rules check existence (exists() ignores read
+    // rules), so the blocked user is never told.
+    match /blocks/{blockId} {
+      allow create: if signedIn()
+        && request.resource.data.blocker_id == request.auth.uid
+        && request.resource.data.blocked_id is string
+        && request.resource.data.blocked_id != request.auth.uid
+        && blockId == request.auth.uid + '_' + request.resource.data.blocked_id;
+      allow read, delete: if signedIn()
+        && resource.data.blocker_id == request.auth.uid;
+      allow update: if false;
+    }
+
+    // User reports: doc id "{reporterUid}_{reportedUid}", once per pair.
+    // Create-only; reviewed in the Firebase console.
+    match /user_reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.reporter_id == request.auth.uid
+        && request.resource.data.reported_id is string
+        && request.resource.data.reported_id != request.auth.uid
+        && reportId == request.auth.uid + '_' + request.resource.data.reported_id;
+      allow read: if signedIn()
+        && resource.data.reporter_id == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Chat: two fixed participants per thread, set at creation.
+    //  - Listing threads: id "{listingId}_{buyerUid}", seller = listing owner.
+    //  - Direct threads:  id "dm_{lowUid}_{highUid}", participant_ids sorted.
+    // Afterwards participants may only bump last_message/updated_at and their
+    // own last_read / archived entries.
+    match /conversations/{conversationId} {
+      function otherOf(ids) {
+        return ids.removeAll([request.auth.uid])[0];
+      }
+      function validListingThread(data) {
+        return data.get('kind', 'listing') == 'listing'
+          && data.listing_id is string
+          && conversationId == data.listing_id + '_' + request.auth.uid
+          && data.seller_id == get(
+            /databases/$(database)/documents/listings/$(data.listing_id)
+          ).data.owner_id
+          && data.seller_id in data.participant_ids;
+      }
+      function validDirectThread(data) {
+        let ids = data.participant_ids;
+        return data.kind == 'direct'
+          && ids[0] < ids[1]
+          && conversationId == 'dm_' + ids[0] + '_' + ids[1];
+      }
+      // Map field (last_read / archived) may only change at the caller's key.
+      function ownKeyOnly(field) {
+        return request.resource.data.get(field, {})
+          .diff(resource.data.get(field, {}))
+          .affectedKeys().hasOnly([request.auth.uid]);
+      }
+
+      // resource == null lets the client probe its deterministic id before
+      // creating the thread.
+      allow read: if signedIn()
+        && (resource == null
+          || request.auth.uid in resource.data.participant_ids);
+      allow create: if signedIn()
+        && request.resource.data.participant_ids is list
+        && request.resource.data.participant_ids.size() == 2
+        && request.auth.uid in request.resource.data.participant_ids
+        && otherOf(request.resource.data.participant_ids) != request.auth.uid
+        && !blockedBetween(request.auth.uid,
+          otherOf(request.resource.data.participant_ids))
+        && (validDirectThread(request.resource.data)
+          || validListingThread(request.resource.data));
+      allow update: if signedIn()
+        && request.auth.uid in resource.data.participant_ids
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'participant_ids', 'participants', 'seller_id', 'listing_id',
+          'listing_type', 'kind'
+        ])
+        && ownKeyOnly('last_read')
+        && ownKeyOnly('archived');
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        function conversation() {
+          return get(
+            /databases/$(database)/documents/conversations/$(conversationId)
+          ).data;
+        }
+        function inConversation() {
+          return signedIn()
+            && request.auth.uid in conversation().participant_ids;
+        }
+        allow read: if inConversation();
+        allow create: if inConversation()
+          && request.resource.data.sender_id == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 2000
+          && !blockedBetween(request.auth.uid,
+            conversation().participant_ids.removeAll([request.auth.uid])[0]);
+        allow update, delete: if false;
+      }
+
+      // Typing presence: one doc per participant ({uid}), written by the
+      // typist and read by the other side; expires after 5s client-side.
+      match /typing/{uid} {
+        allow read: if signedIn()
+          && request.auth.uid in get(
+            /databases/$(database)/documents/conversations/$(conversationId)
+          ).data.participant_ids;
+        allow write: if signedIn()
+          && request.auth.uid == uid
+          && request.auth.uid in get(
+            /databases/$(database)/documents/conversations/$(conversationId)
+          ).data.participant_ids;
+      }
+    }
+  }
+}

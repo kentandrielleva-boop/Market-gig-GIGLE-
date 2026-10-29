@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Branded splash background: AppColors.deepTeal #006B5E -->
+    <color name="splash_background">#006B5E</color>
+    <!-- Launcher background showing through transparent logo padding -->
+    <color name="ic_launcher_background">#FFFFFF</color>
+</resources>

@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "697991981760",
+    "project_id": "marketplace-gig",
+    "storage_bucket": "marketplace-gig.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:697991981760:android:bbd938877597666001db25",
+        "android_client_info": {
+          "package_name": "com.gigl.marketplace_gig"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCu373ULgUAnHXdk43ihTpr9PEGyREMfjY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:697991981760:android:70ecb60a22eaeaf301db25",
+        "android_client_info": {
+          "package_name": "com.gigl.marketplacegig"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCu373ULgUAnHXdk43ihTpr9PEGyREMfjY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
